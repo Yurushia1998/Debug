@@ -36,7 +36,7 @@ def define_basic_flags():
   flags.DEFINE_integer('num_img', 50000, 'number of img used for active selection')
   flags.DEFINE_integer('warmup_iteration', 0, 'number of warmup iteration using pseudo clean')
   flags.DEFINE_bool('rigged_test', False, 'Use EMA')
-  flags.DEFINE_bool('using_colab', False, 'Use colab')
+  flags.DEFINE_string('using_colab', '', 'Use colab')
   flags.DEFINE_bool('use_GMM_pseudo_classification', False, 'Use GMM for classification')
   flags.DEFINE_string('use_pseudo_label_loss_for_features', 'union_GMM_2_loss', 'Type of loss used for GMM')
   flags.DEFINE_string('update_probe', '', 'update probe or not')
