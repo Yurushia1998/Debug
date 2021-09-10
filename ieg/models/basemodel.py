@@ -14,14 +14,19 @@ from ieg.models import wrn
 import numpy as np
 import tensorflow.compat.v1 as tf
 from tqdm import tqdm
-from sklearn.metrics.pairwise import cosine_similarity
+
 import torch
 import torch.nn as nn
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.metrics import accuracy_score
+import torch.nn.functional as functional
+from scipy.linalg import fractional_matrix_power
+from sklearn.mixture import GaussianMixture
+import scipy
+
 
 FLAGS = flags.FLAGS
 logging = tf.logging
-from sklearn.mixture import GaussianMixture
 
 
 def create_network(name, num_classes):
@@ -169,7 +174,7 @@ class BaseModel(Trainer):
     self.strategy = strategy
     self.set_dataset(dataset)
     self.calibrate_flags()
-    self.expect_features = tf.ones([self.dataset.num_classes,256])
+
     with self.strategy.scope():
       logging.info('[BaseModel] Parallel training in {} devices'.format(
           strategy.num_replicas_in_sync))
@@ -184,8 +189,6 @@ class BaseModel(Trainer):
 
       self.optimizer = tf.train.MomentumOptimizer(
           learning_rate=self.learning_rate, momentum=FLAGS.momentum)
-      self.optimizer_probe = tf.train.GradientDescentOptimizer(
-          learning_rate=0.005)
       self.acc_func = tf.metrics.accuracy
 
       if FLAGS.use_ema:
@@ -357,7 +360,6 @@ class BaseModel(Trainer):
     """
     self.clean_acc_history()
     labels, preds, logits = [], [], []
-
     with self.strategy.scope():
       self.sess.run(self.eval_input_iterator.initializer)
       vds, vbs = self.dataset.val_dataset_size, FLAGS.val_batch_size
@@ -394,9 +396,6 @@ class BaseModel(Trainer):
           return_counts=True)
       top5acc = utils.topk_accuracy(
           logits, labels, topk=5, ignore_label_above=self.dataset.num_classes)
-
-
-
       self.eval_acc_on_train.assign(
           np.array(
               [float(offline_accuracy),
@@ -446,14 +445,8 @@ class BaseModel(Trainer):
       self.eval_op = self.eval_step()
       if FLAGS.active:
         self.train_clean_op = self.train_step_clean()
-      self.update_probe_op = self.update_probe_operator()
-      self.update_expected_probe_op = self.update_expected_probe_operator()
       if FLAGS.update_probe:
         self.reset_op = self.reset_step()
-      if FLAGS.update_loss or 'reset_all' in FLAGS.update_probe:
-        self.get_logit_op = self.get_logits_step()
-      if "BALD" in FLAGS.update_probe or "var_ratio" in FLAGS.update_probe:
-        self.dropout_eval_op = self.get_dropout_eval_op()
 
   def train_step(self):
     """A single train step with strategy."""
@@ -561,63 +554,109 @@ class BaseModel(Trainer):
 
     return [mean_acc, logits, labels, summary]
 
-  def get_new_loss(self,labels,old_labels,logits,old_loss,judge = False):
-    criterion1 = nn.CrossEntropyLoss(reduction = 'none')
-    torch_labels =  torch.from_numpy(np.array(labels)).to(torch.int64)
-    logits_torch = torch.from_numpy(logits)
-    return criterion1(logits_torch,torch_labels)
-  def get_clean_noisy_index(self,features):
-    all_features = np.array(features)
-    sorted_value = np.argsort(all_features)
-    
-    all_features = np.expand_dims(all_features,axis = 1)
-    print("SHape all_features: ",all_features.shape)
-    gmm = GaussianMixture(n_components=2,max_iter=30,random_state = 0,tol=1e-2,reg_covar=5e-4)
-    gmm.fit(all_features)
-    pseudo_classification = gmm.predict(all_features) 
-    print("ALl mean value: ",gmm.means_)
 
-    clean_set_index = np.argmin(gmm.means_)
-    pseudo_classification[pseudo_classification == clean_set_index] = 2
-    pseudo_classification[pseudo_classification != 2] = 1
-    pseudo_classification[pseudo_classification == 2] = 0
-    all_pseudo_clean_index = list(np.where(pseudo_classification == 0)[0])
-    all_pseudo_noisy_index = list(np.where(pseudo_classification == 1)[0])
-    print("Number of all_pseudo_clean_index and noisy: ",len(all_pseudo_clean_index),len(all_pseudo_noisy_index))
 
-  def relabel(self,all_logits,select_set = "noisy"):
-    threshold = FLAGS.threshold_relabel
+  def relabel_mix(self,all_logits,relabel = True,):
     threshold_upper_bound = 1
-    threshold_lower_bound = float(threshold)
-    mean_threshold = (threshold_upper_bound+threshold_lower_bound)/2
-    std_threshold = threshold_upper_bound - mean_threshold
-    if select_set == "noisy":
-      curr_index_set = self.dataset.noise_index
-      similarity_matrix = cosine_similarity(self.dataset.all_data_features[0][self.dataset.noise_index],self.dataset.all_data_features[0][self.dataset.clean_index])
-    else:
-      curr_index_set = self.dataset.clean_index
-      similarity_matrix = cosine_similarity(self.dataset.all_data_features[0][self.dataset.clean_index],self.dataset.all_data_features[0][self.dataset.clean_index])
-    nearest_neighbor_matrix = torch.topk(torch.Tensor(similarity_matrix),k=100,dim = 1)
-    nearest_neighbor_label_matrix = torch.Tensor(self.dataset.all_data_label[self.dataset.clean_index])[nearest_neighbor_matrix[1]]
-    nearest_neighbor_label_matrix = nearest_neighbor_label_matrix.int()
-    all_count = torch.vstack([torch.bincount(nearest_neighbor_label_matrix[i],minlength = self.dataset.num_classes) for i in range(nearest_neighbor_label_matrix.shape[0])])
-    preudo_label = np.argmax(all_count,axis = 1)
+    threshold_clean = float(FLAGS.threshold_clean)
+    mean_threshold_clean = (threshold_upper_bound+threshold_clean)/2
+    std_threshold_clean = threshold_upper_bound - mean_threshold_clean
 
-    curr_prediction = np.argmax(all_logits,axis = 1)[curr_index_set]
-    curr_pro_prediction = np.max(all_logits,axis = 1)[curr_index_set]
-    top_max_predict_index = np.where(abs(curr_pro_prediction - mean_threshold) <= std_threshold)[0]
-    final_max_class_matrix = curr_prediction[top_max_predict_index]
-    final_max_preudo_label_matrix = preudo_label[top_max_predict_index].numpy()
-    selected_idx = np.where(final_max_class_matrix == final_max_preudo_label_matrix)[0]
-    predicted_label = final_max_preudo_label_matrix[selected_idx]
-    final_selected_idx = np.array(curr_index_set)[top_max_predict_index[selected_idx]]
-    if "max_sim_pseudo" in FLAGS.update_probe and select_set == "noisy":
-      self.dataset.left_noise_index_knn = [i for i in self.dataset.noise_index if i not in final_selected_idx]
-      self.dataset.pseudo_knn_label = preudo_label[[i for i in range(len(self.dataset.noise_index)) if i not in top_max_predict_index[selected_idx]]]
-      tf.logging.info("Accuracy of pseudo noisy label:"+str(accuracy_score(self.dataset.all_data_label_correct[self.dataset.left_noise_index_knn],self.dataset.pseudo_knn_label)))
-    return final_selected_idx,predicted_label
+    similarity_matrix = cosine_similarity(self.dataset.all_data_features[0][self.dataset.noise_index],self.dataset.all_data_features[0][self.dataset.clean_index])
+    nearest_neighbor_matrix = torch.topk(torch.Tensor(similarity_matrix),k=50,dim = 1)
+    nearest_neighbor_matrix_average = np.mean(nearest_neighbor_matrix[0].numpy(),axis = 1)
+    nearest_neighbor_label_matrix = torch.Tensor(self.dataset.all_data_label[self.dataset.clean_index])[nearest_neighbor_matrix[1]].int()
 
-  
+    all_count = torch.vstack([torch.bincount(nearest_neighbor_label_matrix[i],minlength = self.dataset.num_classes) for i in range(nearest_neighbor_label_matrix.shape[0])]).numpy()
+    preudo_label = np.divide(all_count.T,np.sum(all_count,axis = 1)).T
+
+    curr_prediction = np.argmax(all_logits,axis = 1)[self.dataset.noise_index]
+    curr_pro_prediction = np.max(all_logits,axis = 1)[self.dataset.noise_index]
+    final_prediction =(all_logits[self.dataset.noise_index].T*nearest_neighbor_matrix_average).T  +( preudo_label.T * (1 - nearest_neighbor_matrix_average)).T
+    final_prediction_proba = np.max(final_prediction,axis = 1)
+    final_prediction_label = np.argmax(final_prediction,axis = 1)
+    
+    top_max_predict_index = np.where(abs(final_prediction_proba - mean_threshold_clean) <= std_threshold_clean)[0]
+    final_selected_idx_clean = np.array(self.dataset.noise_index)[top_max_predict_index] 
+    if not relabel:
+      top_max_predict_index, final_selected_idx_clean = [],[], []
+    self.dataset.left_noise_index_knn = [i for i in self.dataset.noise_index if i not in final_selected_idx_clean]
+    self.dataset.pseudo_knn_label = final_prediction_label[[i for i in range(len(self.dataset.noise_index)) if i not in top_max_predict_index]]
+    tf.logging.info("Accuracy of pseudo noisy label:"+str(accuracy_score(self.dataset.all_data_label_correct[self.dataset.left_noise_index_knn],self.dataset.pseudo_knn_label)))
+    return final_prediction_label[top_max_predict_index],final_selected_idx_clean
+
+  def reset_train_ds(self,update_probe_set = False,update_clean_set = False,lr = 1):
+    all_logits = []
+    all_original_logits = []
+    all_features = []
+    all_loss = []
+    all_uncertainty = []
+    num_batch = int(np.ceil(self.dataset.all_data.shape[0]/FLAGS.batch_size))
+    
+    with self.strategy.scope():
+      for i in range(num_batch):
+        mean_logit,uncertainty,original_logit,feature,loss = self.sess.run(self.reset_op)
+        all_logits.append(mean_logit)
+        all_features.append(np.squeeze(feature))
+        all_loss.extend(np.squeeze(loss))
+
+        all_original_logits.append(np.squeeze(original_logit))  
+        
+        all_uncertainty.extend(np.squeeze(uncertainty))
+
+      all_features = np.vstack(all_features)
+      all_logits = np.vstack(all_logits)
+      all_original_logits = np.vstack(all_original_logits)
+      all_loss = np.array(all_loss)
+      all_uncertainty = np.array(all_uncertainty)
+      self.dataset.all_uncertainty_training = all_uncertainty
+      if "last" in FLAGS.using_new_features:
+        self.dataset.milestone_fea = all_features
+      curtainty_label_matrix = None
+      if  "relabel" in FLAGS.update_probe :
+                
+        if "mKnn" in FLAGS.update_probe:
+          print("Using mKnn.....")
+          
+          curr_all_logit = np.sum(self.dataset.all_predict_logit[0],axis = 1)
+          curr_all_logit += all_logits
+          curr_all_logit = np.divide(curr_all_logit,(self.dataset.all_predict_logit[1][:,None]+1))
+          
+          curr_samples_logits = self.dataset.all_predict_logit[0][:,1:,:]
+          print("Number of sample previous count: ",np.unique(self.dataset.all_predict_logit[1],return_counts = True))
+          def change_data(x,data,num_data,all_label):
+            curr_data = data[x]
+            if num_data[x][0] == 0:
+               raise ValueError('Wrong')
+            
+            curr_data = curr_data[0][-num_data[x][0]:]
+            results = (curr_data == all_label[x]).all()
+            return results
+
+          self.dataset.all_predict_logit[0][:,:-1,:] = curr_samples_logits
+          assert (self.dataset.all_predict_logit[0][:,-1,:] == self.dataset.all_predict_logit[0][:,-2,:]).all()
+          self.dataset.all_predict_logit[0][:,-1,:] = all_logits.copy()
+          self.dataset.all_predict_logit[1] += 1
+          self.dataset.all_predict_logit[1] = (self.dataset.all_predict_logit[1] <= 5)*self.dataset.all_predict_logit[1] + (self.dataset.all_predict_logit[1] > 5)*5
+          print("Number of sample previous count 2: ",np.unique(self.dataset.all_predict_logit[1],return_counts = True))
+          curtainty_matrix = np.argmax(self.dataset.all_predict_logit[0],axis = 2)
+          all_index = np.array([i for i in range(len(self.dataset.all_data_label))])
+          all_index = np.expand_dims(all_index,axis = 1)
+          curtainty_label_matrix =  np.apply_along_axis(change_data, 1,arr = all_index,data = curtainty_matrix, num_data = self.dataset.all_predict_logit[1].astype(int), all_label = self.dataset.all_data_label.astype(int))
+          
+          all_logits = curr_all_logit
+          predicted_label,final_selected_idx_clean = self.relabel_mix(all_logits,relabel = update_clean_set)
+          print("Accuracy of model: ",accuracy_score(np.argmax(all_logits,axis = 1),self.dataset.all_data_label_correct))
+          print("Accuracy of noise: ",accuracy_score(self.dataset.all_data_label,self.dataset.all_data_label_correct))
+          same_label = np.where(np.argmax(all_logits,axis = 1) == self.dataset.all_data_label_correct)[0]
+          same_label_noise = np.where(np.argmax(all_logits,axis = 1) == self.dataset.all_data_label)[0]
+          same_label = list(set(same_label) & set(self.dataset.clean_index))
+          print("Number of same labels: ",len(same_label),len(self.dataset.clean_index))
+          print("Number of same labels noise: ",len(same_label_noise))
+        if not update_clean_set:
+          predicted_label,final_selected_idx_clean = [],[],[]
+        
+        self.dataset.reset_probe(predicted_label,final_selected_idx_clean,all_features,all_logits,all_loss,update_probe_set,lr,all_original_logits,curtainty_label_matrix = curtainty_label_matrix)
   def reset_step(self):
     def step_fn_reset(inputs):
       """Step functon.
@@ -638,8 +677,8 @@ class BaseModel(Trainer):
       loss = tf.losses.sparse_softmax_cross_entropy(labels, logits_2,reduction = tf.losses.Reduction.NONE)
       
       
-      return tf.identity(logits),tf.identity(logits_2),tf.identity(logits_3),tf.identity(feature_2),tf.identity(loss),tf.identity(labels)
-    logits,logits_2,logits_3,features,loss,labels = self.strategy.run(step_fn_reset, args=((next(self.train_reset_input_iterator)),))
+      return tf.identity(logits),tf.identity(logits_2),tf.identity(logits_3),tf.identity(feature_2),tf.identity(loss)
+    logits,logits_2,logits_3,features,loss = self.strategy.run(step_fn_reset, args=((next(self.train_reset_input_iterator)),))
  
     logits = self.strategy.unwrap(logits)
     logits = tf.cast(logits, tf.float32)
@@ -656,37 +695,10 @@ class BaseModel(Trainer):
 
     curr_logit = tf.stack([logits_softmax,logits_2_softmax,logits_3_softmax],axis = 0)
     curr_logit = tf.reduce_mean(curr_logit,axis = 0)
-    
+
     curr_logit = tf.squeeze(curr_logit)
     top_2,indices = tf.math.top_k(curr_logit, k=2)
     uncertainty = top_2[:,0] - top_2[:,1]
     features = self.strategy.unwrap(features)
-    labels = self.strategy.unwrap(labels)
-    loss = self.strategy.unwrap(loss)
-
-  
-    return [curr_logit,uncertainty,logits_2,features,loss,labels]
-
-  def get_dropout_eval_op(self):
-    def step_dropout_eval(inputs):
-      """Step functon.
-
-      Args:
-        inputs: inputs from data iterator
-
-      Returns:
-        a set of variables want to observe in Tensorboard
-      """
-      net = self.net
-      images, labels  = inputs
-      
-      logits,feature = net(images, name='model', reuse=tf.AUTO_REUSE, training=True)
-      return tf.identity(logits),tf.identity(labels)
-    logits,labels = self.strategy.run(step_dropout_eval, args=((next(self.dropout_input_iterator)),))
- 
-    logits = self.strategy.unwrap(logits)
-    logits = tf.cast(logits, tf.float32)
-    logits_softmax = tf.compat.v1.math.softmax(logits)
-    logits_softmax = tf.squeeze(logits_softmax)
-
-    return [logits_softmax,labels]
+    loss = self.strategy.unwrap(loss)  
+    return [curr_logit,uncertainty,logits_2,features,loss]

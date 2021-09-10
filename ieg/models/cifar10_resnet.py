@@ -161,9 +161,8 @@ def resnet_model_fn(inputs,
   x = batchnormalization_layer(inputs=x)
   x = tf.nn.relu(x)
   x = tf.layers.average_pooling2d(x, (8, 8), (1, 1))
- 
   y = tf.layers.flatten(x)
-  #y = tf.layers.dropout(y,rate = 0.5,training = training)
+
   regularizer = tf.keras.regularizers.L2(L2)
   outputs = tf.layers.dense(
       y, units=num_classes, kernel_regularizer=regularizer)

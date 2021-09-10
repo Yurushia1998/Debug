@@ -13,6 +13,7 @@ def define_basic_flags():
 
   flags.DEFINE_integer('max_iteration', 100000, 'Number of iteration')
   flags.DEFINE_float('learning_rate', 0.1, 'Learning rate')
+  flags.DEFINE_float('scaled_loss_clean', 1.0, 'scaled_loss_clean')
   flags.DEFINE_integer('batch_size', 100, 'Batch size')
   flags.DEFINE_integer('val_batch_size', 100, 'Validation data batch size.')
   flags.DEFINE_integer('restore_step', 0, ('Checkpoint id.'
@@ -32,15 +33,22 @@ def define_basic_flags():
   flags.DEFINE_string('experiment_name', 'DivideMix_cifar10', 'name of experiment')
   flags.DEFINE_string('AL_model', 'DivideMix', 'name of model for active selection')
   flags.DEFINE_string('extra_name', '', 'name of model')
-  flags.DEFINE_string('update_probe', '', 'update probe or not')
-  flags.DEFINE_string('using_loss', '', 'update loss type')
-  flags.DEFINE_float('threshold_relabel',0.5, 'update probe or not')
-  flags.DEFINE_bool('update_loss', False, 'update_loss')
   flags.DEFINE_integer('num_img', 50000, 'number of img used for active selection')
   flags.DEFINE_integer('warmup_iteration', 0, 'number of warmup iteration using pseudo clean')
   flags.DEFINE_bool('rigged_test', False, 'Use EMA')
+  flags.DEFINE_bool('using_colab', False, 'Use colab')
   flags.DEFINE_bool('use_GMM_pseudo_classification', False, 'Use GMM for classification')
   flags.DEFINE_string('use_pseudo_label_loss_for_features', 'union_GMM_2_loss', 'Type of loss used for GMM')
+  flags.DEFINE_string('update_probe', '', 'update probe or not')
+  flags.DEFINE_string('using_loss', '', 'update loss type')
+  flags.DEFINE_string('start_proba', '', 'update loss type')
+  flags.DEFINE_float('uncer_factor', 1, 'multiplication factor of CL')
+  flags.DEFINE_float('scaled_loss', 1.0, 'scaled weight of unsupervised loss')
+  flags.DEFINE_string('using_new_features', "", 'using_new_features ')
+  flags.DEFINE_string('update_loss', "", 'update_loss')
+  flags.DEFINE_string('threshold_relabel',"0.5", 'update probe or not')
+  flags.DEFINE_float('threshold_clean',0.5, 'update probe or not')
+  flags.DEFINE_string('pretrained_path', '', 'pretrained_path')
 
 
   flags.DEFINE_enum('network_name', 'wrn28-10',
@@ -64,7 +72,6 @@ def define_basic_flags():
   flags.DEFINE_bool('gcloud', False, 'Use Gcloud')
   flags.DEFINE_string('dst_bucket_project', "aiml-carneiro-research", 'dst_bucket_project')
   flags.DEFINE_string('dst_bucket_name', "aiml-carneiro-research-data", 'dst_bucket_name')
-  flags.DEFINE_string('used_pretrained_20k', "", 'pretrained path file first 20k iteration')
   flags.DEFINE_enum('lr_schedule', 'cosine',
                     ['cosine', 'custom_step', 'cosine_warmup', 'exponential'],
                     'Learning rate schedule.')

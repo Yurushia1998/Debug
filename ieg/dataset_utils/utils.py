@@ -164,7 +164,7 @@ def random_augmentation(images, magnitude=10, nops=2):
   return augmented_images
 
 
-def autoaug_batch_process_map_fn(images, labels):
+def autoaug_batch_process_map_fn(images, labels,sample_index):
   """tf.data.Dataset map function to enable python AutoAugmnet with tf.py_func.
 
   It is usually called after tf.data.Dataset is batched.
@@ -191,7 +191,7 @@ def autoaug_batch_process_map_fn(images, labels):
   images = tf.concat([tf.expand_dims(images, 1),
                       tf.expand_dims(aa_images, 1)],
                      axis=1)
-  return images, labels
+  return images, labels,sample_index
 def autoaug_batch_process_map_reset_fn(images, labels):
   """tf.data.Dataset map function to enable python AutoAugmnet with tf.py_func.
 

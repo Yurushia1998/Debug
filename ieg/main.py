@@ -25,6 +25,8 @@ FLAGS = flags.FLAGS
 
 options.define_basic_flags()
 
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+
 
 def train(model, sess):
   """Training launch function."""
@@ -51,30 +53,41 @@ def main(_):
   if 'cifar' in FLAGS.dataset:
     dataset = datasets.CIFAR()
     if FLAGS.pretrained_noise:
-      use_pretrained = "pretrained"
+      use_pretrained = "_pretrained"
     else:
       use_pretrained = ""
+
     if FLAGS.warmup_iteration > 0:
-      use_warmup = "_warmup_"+str(FLAGS.warmup_iteration)
+      use_warmup = "_warm_"+str(FLAGS.warmup_iteration)
     else:
       use_warmup = ""
-    if FLAGS.use_GMM_pseudo_classification:
-      use_GMM_pseudo_classification = "_use_GMM"
-    else:
-      use_GMM_pseudo_classification = ""
-    if len(FLAGS.update_probe) > 0:
-      update_probe = "_"+str(FLAGS.update_probe)+"_thre_"+str(FLAGS.threshold_relabel)
 
+    if len(FLAGS.update_probe) > 0:
+      update_probe = "_"+str(FLAGS.update_probe)+"_thre_"+str(FLAGS.threshold_relabel)+"_"+str(FLAGS.threshold_clean)
     else:
       update_probe = ""
+
     if len(FLAGS.using_loss) > 0:
       using_loss = "_"+str(FLAGS.using_loss)
-
     else:
       using_loss = ""
+
+    if FLAGS.scaled_loss != 1:
+      scaled_loss = "_sca_l_"+str(FLAGS.scaled_loss)
+    else:
+      scaled_loss = ""
+
+    if "_" in FLAGS.update_loss:
+      params = "_"+str(FLAGS.update_loss)
+    else:
+      params = ""
+    if len(FLAGS.using_new_features) > 0:
+      new = "_"+str(FLAGS.using_new_features)
+    else:
+      new = ""
     FLAGS.checkpoint_path = os.path.join(
-        FLAGS.checkpoint_path, '{}_p{}_{}_{}_{}_{}{}{}{}{}'.format(FLAGS.dataset,
-                                               FLAGS.probe_dataset_hold_ratio,FLAGS.diverse_and_balance,FLAGS.extra_name,FLAGS.seed,use_pretrained,use_warmup,use_GMM_pseudo_classification,update_probe,using_loss),
+        FLAGS.checkpoint_path, '{}_p{}_{}{}_{}{}{}{}{}{}{}'.format(FLAGS.dataset,
+                                               FLAGS.probe_dataset_hold_ratio,FLAGS.seed,use_pretrained,FLAGS.extra_name,use_warmup,update_probe,using_loss,scaled_loss,params,new),
         FLAGS.network_name)
   elif 'webvisionmini' in FLAGS.dataset:
     # webvision mini version

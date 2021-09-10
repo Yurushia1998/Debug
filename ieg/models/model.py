@@ -8,19 +8,19 @@ from __future__ import print_function
 from absl import flags
 
 from ieg import utils
-from ieg.dataset_utils.utils import autoaug_batch_process_map_fn,autoaug_batch_process_map_reset_fn,cifar_process
+from ieg.dataset_utils.utils import autoaug_batch_process_map_fn,autoaug_batch_process_map_reset_fn
 from ieg.models import networks
 from ieg.models.basemodel import BaseModel
 from ieg.models.custom_ops import logit_norm
 from ieg.models.custom_ops import MixMode
 from ieg.dataset_utils.datasets import upload_checkpoint 
-
+import torch.nn.functional as functional
+import torch
 
 import numpy as np
 import tensorflow.compat.v1 as tf
 from tqdm import tqdm
 import shutil 
-
 
 FLAGS = flags.FLAGS
 logging = tf.logging
@@ -36,31 +36,34 @@ class IEG(BaseModel):
     self.augment = MixMode()
     self.beta = 0.5  # MixUp hyperparam
     self.nu = 2      # K value for label guessing
-    print("Shape initializer: ",self.dataset.probe_data.shape)
-    self.probe_images_weight = tf.get_variable("probe_images_weight",  initializer=self.dataset.probe_data,trainable = True)
-    self.probe_images_weight = cifar_process(self.probe_images_weight,False)
 
   def set_input(self):
-
     if len(self.dataset.train_dataflow.output_shapes[0]) == 3:
       # Use for cifar
-      train_ds = self.dataset.train_dataflow.shuffle(
-          buffer_size=self.batch_size * 10).repeat().batch(
+      if not FLAGS.active:
+        train_ds = self.dataset.train_dataflow.shuffle(
+            buffer_size=self.batch_size * 10).repeat().batch(
+                self.batch_size, drop_remainder=True
+            ).map(
+                # strong augment each batch data and expand to 5D [Bx2xHxWx3]
+                autoaug_batch_process_map_fn,
+                num_parallel_calls=tf.data.experimental.AUTOTUNE).prefetch(
+                    buffer_size=tf.data.experimental.AUTOTUNE)
+      else:
+        train_ds = self.dataset.train_dataflow.batch(
               self.batch_size, drop_remainder=True
           ).map(
               # strong augment each batch data and expand to 5D [Bx2xHxWx3]
               autoaug_batch_process_map_fn,
               num_parallel_calls=tf.data.experimental.AUTOTUNE).prefetch(
                   buffer_size=tf.data.experimental.AUTOTUNE)
-      if FLAGS.active:
-        if FLAGS.update_probe:
-          train_reset_ds = self.dataset.train_dataflow_reset.batch(
-                self.batch_size, drop_remainder=False
-            ).map(
-                # strong augment each batch data and expand to 5D [Bx2xHxWx3]
-                autoaug_batch_process_map_reset_fn,
-                num_parallel_calls=tf.data.experimental.AUTOTUNE).prefetch(
-                    buffer_size=tf.data.experimental.AUTOTUNE)
+        train_reset_ds = self.dataset.train_dataflow_reset.batch(
+              self.batch_size, drop_remainder=False
+          ).map(
+              # strong augment each batch data and expand to 5D [Bx2xHxWx3]
+              autoaug_batch_process_map_reset_fn,
+              num_parallel_calls=tf.data.experimental.AUTOTUNE).prefetch(
+                  buffer_size=tf.data.experimental.AUTOTUNE)
         train_clean_ds = self.dataset.train_dataflow_clean.shuffle(
             buffer_size=self.batch_size * 10).repeat().batch(
                 self.batch_size, drop_remainder=True
@@ -70,15 +73,18 @@ class IEG(BaseModel):
                 num_parallel_calls=tf.data.experimental.AUTOTUNE).prefetch(
                     buffer_size=tf.data.experimental.AUTOTUNE)
     else:
-      train_ds = self.dataset.train_dataflow.shuffle(
-          buffer_size=self.batch_size * 10).repeat().batch(
+      if not FLAGS.active:
+        train_ds = self.dataset.train_dataflow.shuffle(
+            buffer_size=self.batch_size * 10).repeat().batch(
+                self.batch_size, drop_remainder=True).prefetch(
+                    buffer_size=tf.data.experimental.AUTOTUNE)
+      else:
+        train_ds = self.dataset.train_dataflow.batch(
               self.batch_size, drop_remainder=True).prefetch(
                   buffer_size=tf.data.experimental.AUTOTUNE)
-      if FLAGS.active:
-        if FLAGS.update_probe:
-          train_reset_ds = self.dataset.train_dataflow_reset.batch(
-                    self.batch_size, drop_remainder=False).prefetch(
-                        buffer_size=tf.data.experimental.AUTOTUNE)
+        train_reset_ds = self.dataset.train_dataflow_reset.batch(
+                  self.batch_size, drop_remainder=False).prefetch(
+                      buffer_size=tf.data.experimental.AUTOTUNE)
       
 
         train_clean_ds = self.dataset.train_dataflow_clean.shuffle(
@@ -86,23 +92,11 @@ class IEG(BaseModel):
                 self.batch_size, drop_remainder=True).prefetch(
                     buffer_size=tf.data.experimental.AUTOTUNE)
     # no shuffle for probe, so a batch is class balanced.
-    selected_img_ds = self.dataset.selected_img_dataflow.repeat().batch(
-        self.dataset.num_classes*self.dataset.num_probe_per_class, drop_remainder=True).prefetch(
-            buffer_size=tf.data.experimental.AUTOTUNE)
     probe_ds = self.dataset.probe_dataflow.repeat().batch(
-        self.dataset.probe_size, drop_remainder=True).prefetch(
-            buffer_size=tf.data.experimental.AUTOTUNE)
-    if FLAGS.update_probe:
-      dropout_ds = self.dataset.train_dataflow_dropout.batch(
-        FLAGS.val_batch_size, drop_remainder=False).prefetch(
+        self.batch_size, drop_remainder=True).prefetch(
             buffer_size=tf.data.experimental.AUTOTUNE)
 
     val_ds = self.dataset.val_dataflow.batch(
-        FLAGS.val_batch_size, drop_remainder=False).prefetch(
-            buffer_size=tf.data.experimental.AUTOTUNE)
-
-    if FLAGS.update_loss:
-      logit_ds = self.dataset.train_dataflow_logit.batch(
         FLAGS.val_batch_size, drop_remainder=False).prefetch(
             buffer_size=tf.data.experimental.AUTOTUNE)
 
@@ -112,28 +106,18 @@ class IEG(BaseModel):
     self.probe_input_iterator = (
         self.strategy.experimental_distribute_dataset(
             probe_ds).make_initializable_iterator())
-    self.selected_img_input_iterator = (
-        self.strategy.experimental_distribute_dataset(
-            selected_img_ds).make_initializable_iterator())
 
-    self.eval_input_iterator = (
-        self.strategy.experimental_distribute_dataset(
-            val_ds).make_initializable_iterator())
     if FLAGS.active:
       self.train_clean_input_iterator = (
           self.strategy.experimental_distribute_dataset(
               train_clean_ds).make_initializable_iterator())
-      if FLAGS.update_probe:
-        self.train_reset_input_iterator = (
-            self.strategy.experimental_distribute_dataset(
-                train_reset_ds).make_initializable_iterator())
-        self.dropout_input_iterator = (
+      self.train_reset_input_iterator = (
           self.strategy.experimental_distribute_dataset(
-              dropout_ds).make_initializable_iterator())
-    if FLAGS.update_loss:
-      self.logit_input_iterator = (
+              train_reset_ds).make_initializable_iterator())
+
+    self.eval_input_iterator = (
         self.strategy.experimental_distribute_dataset(
-            logit_ds).make_initializable_iterator())
+            val_ds).make_initializable_iterator())
 
   def meta_momentum_update(self, grad, var_name, optimizer):
     # Finds corresponding momentum of a var name
@@ -192,22 +176,9 @@ class IEG(BaseModel):
     split_pos = [tf.shape(l_images)[0], zbs]
     l_augment_labels, u_augment_labels = tf.split(
         augment_labels, split_pos, axis=0)
-    if FLAGS.using_loss == "MSE":
-      u_loss = tf.losses.mean_squared_error(u_augment_labels, u_logit)
-      l_loss = tf.losses.mean_squared_error(l_augment_labels, logit[0])
-    elif FLAGS.using_loss == "MAE":
-      #mae = tf.keras.losses.MeanAbsoluteError(reduction = tf.losses.Reduction.SUM_OVER_BATCH_SIZE)
-      u_loss = tf.keras.losses.mean_absolute_error(u_augment_labels, u_logit)
-      
-      
-      l_loss = tf.keras.losses.mean_absolute_error(l_augment_labels, logit[0])
-      #check = tf.Print([tf.shape(u_loss),tf.shape(l_loss)],[tf.shape(u_loss),tf.shape(l_loss)],message = "Shape uloss and lloss: ")
-      #with tf.control_dependencies([check]):
-      u_loss = tf.reduce_sum(u_loss)/(2*FLAGS.batch_size)
-      l_loss = tf.reduce_sum(l_loss)/(FLAGS.batch_size)
-    else:
-      u_loss = tf.losses.softmax_cross_entropy(u_augment_labels, u_logit)
-      l_loss = tf.losses.softmax_cross_entropy(l_augment_labels, logit[0])
+
+    u_loss = tf.losses.softmax_cross_entropy(u_augment_labels, u_logit)
+    l_loss = tf.losses.softmax_cross_entropy(l_augment_labels, logit[0])
 
     loss = tf.math.add(
         l_loss, u_loss * FLAGS.ce_factor, name='crossentropy_minimization_loss')
@@ -276,7 +247,7 @@ class IEG(BaseModel):
     else:
       losses.append(tf.constant(0, tf.float32))
 
-    return losses
+    return losses,aug_logits
 
   def meta_optimize(self):
     """Meta optimization step."""
@@ -387,7 +358,7 @@ class IEG(BaseModel):
     new_eps = tf.where(grad_eps < 0, x=tf.ones_like(eps), y=tf.zeros_like(eps))
 
     return tf.stop_gradient(weight), tf.stop_gradient(
-        new_eps), meta_loss, meta_acc
+        new_eps), meta_loss, meta_acc, tf.stop_gradient(g_logits)
 
   def train_step(self):
 
@@ -401,8 +372,9 @@ class IEG(BaseModel):
         a set of variables want to observe in Tensorboard
       """
       net = self.net
-      (all_images, labels), (self.probe_images, self.probe_labels) = inputs
-      assert len(all_images.shape) == 5
+      (all_images, labels,sample_index), (self.probe_images, self.probe_labels,probe_index) = inputs
+      sample_index = tf.cast(sample_index,tf.int32)
+
       images, self.aug_images = all_images[:, 0], all_images[:, 1]
 
       self.images, self.labels = images, labels
@@ -413,191 +385,17 @@ class IEG(BaseModel):
 
       # other losses
       # initialized first to use self.guessed_label for meta step
-      xe_loss, cs_loss = self.unsupervised_loss()
+      (xe_loss, cs_loss),aug_logits = self.unsupervised_loss()
+      logits_softmax = tf.stop_gradient(tf.nn.softmax(logits))
+      aug_logits_softmax = tf.stop_gradient(tf.nn.softmax(aug_logits))
+      final_logit_softmax_2 = tf.stop_gradient(tf.reduce_mean([logits_softmax,aug_logits_softmax],axis = 0))
 
       # meta optimization
-      weight, eps, meta_loss, meta_acc = self.meta_optimize()
+      weight, eps, meta_loss, meta_acc, g_logits_softmax = self.meta_optimize()
+      g_logits_softmax_2 = tf.stop_gradient(tf.nn.softmax(g_logits_softmax))
 
-      ## losses w.r.t new weight and loss
-      onehot_labels = tf.one_hot(labels, self.dataset.num_classes)
-      onehot_labels = tf.cast(onehot_labels, tf.float32)
-      eps_k = tf.reshape(eps, [batch_size, 1])
-
-      mixed_labels = tf.math.add(
-          eps_k * onehot_labels, (1 - eps_k) * self.guessed_label,
-          name='mixed_labels')
-
-      if FLAGS.using_loss == "negative":
-        tf.logging.info("Using negative loss")
-        logits_softmax = tf.nn.softmax(logits)
-        positive_sample = tf.cast(tf.reduce_max(logits_softmax,axis = 0) >= 0.5,tf.float32)
-        negative_mask = tf.cast(logits_softmax <= 0.1,tf.float32)
-        negative_loss = (-tf.reduce_sum(negative_mask*tf.log(1 - logits_softmax),axis = 0)/(tf.reduce_sum(negative_mask,axis = 0)+1e-7))
-
-
-        positive_loss = tf.losses.softmax_cross_entropy(
-            mixed_labels, logits, reduction=tf.losses.Reduction.NONE) * positive_sample
-      
-        # loss with initial weight
-        net_loss1 = tf.reduce_mean(positive_loss) + tf.reduce_mean(negative_loss)
-      elif FLAGS.using_loss == "MAE":
-        tf.logging.info("Using MAE loss")
-        logits_softmax = tf.nn.softmax(logits)
-        #mae = tf.keras.losses.MeanAbsoluteErr(reduction=tf.keras.losses.Reduction.NONE)
-        net_cost = tf.keras.losses.mean_absolute_error(
-          mixed_labels, logits_softmax)
-        net_loss1 = tf.reduce_mean(net_cost)
-      elif FLAGS.using_loss == "MSE":
-        tf.logging.info("Using MSE loss")
-        logits_softmax = tf.nn.softmax(logits)
-        net_cost = tf.losses.mean_squared_error(
-          mixed_labels, logits_softmax, reduction=tf.losses.Reduction.NONE)
-        net_loss1 = tf.reduce_mean(net_cost)
-      else:
-        net_cost = tf.losses.softmax_cross_entropy(
-          mixed_labels, logits, reduction=tf.losses.Reduction.NONE)
-        net_loss1 = tf.reduce_mean(net_cost)
-      # loss with initial eps
-      init_eps = tf.constant(
-          [FLAGS.grad_eps_init] * batch_size, dtype=tf.float32)
-      init_eps = tf.reshape(init_eps, (-1, 1))
-      init_mixed_labels = tf.math.add(
-          init_eps * onehot_labels, (1 - init_eps) * self.guessed_label,
-          name='init_mixed_labels')
-      if FLAGS.using_loss == "negative":
-        tf.logging.info("Using negative loss")
-        positive_sample_2 = tf.cast(tf.reduce_max(logits_softmax,axis = 0) >= 0.5,tf.float32)
-        negative_loss_2 = (-tf.reduce_sum(negative_mask*tf.log(1 - logits_softmax),axis = 0)/(tf.reduce_sum(negative_mask,axis = 0)+1e-7))
-
-
-        
-
-        positive_loss_2 = tf.losses.softmax_cross_entropy(
-            init_mixed_labels, logits, reduction=tf.losses.Reduction.NONE) * positive_sample
-        net_cost2 = positive_loss_2 + negative_loss_2
-        net_loss2 = tf.reduce_sum(tf.math.multiply(net_cost2, weight))
-      elif FLAGS.using_loss == "MAE":
-        tf.logging.info("Using MAE loss")
-        #mae = tf.keras.losses.MeanAbsoluteError(reduction=tf.keras.losses.Reduction.NONE)
-        net_cost2 = tf.keras.losses.mean_absolute_error(
-          init_mixed_labels, logits_softmax)
-        net_loss2 = tf.reduce_sum(tf.math.multiply(net_cost2, weight))
-      elif FLAGS.using_loss == "MSE":
-        tf.logging.info("Using MSE loss")
-        net_cost2 = tf.losses.mean_squared_error(
-          init_mixed_labels, logits_softmax, reduction=tf.losses.Reduction.NONE)
-        net_loss2 = tf.reduce_sum(tf.math.multiply(net_cost2, weight))
-      else:
-        net_cost2 = tf.losses.softmax_cross_entropy(
-          init_mixed_labels, logits, reduction=tf.losses.Reduction.NONE)
-        net_loss2 = tf.reduce_sum(tf.math.multiply(net_cost2, weight))
-
-      net_loss = (net_loss1 + net_loss2) / 2
-
-      net_loss = net_loss + tf.add_n([xe_loss, cs_loss])
-      net_loss += net.regularization_loss
-      net_loss /= self.strategy.num_replicas_in_sync
-
-      # rescale by gpus
-      with tf.control_dependencies(net.updates):
-        net_grads = tf.gradients(net_loss, net.trainable_variables)
-        minimizer_op = self.optimizer.apply_gradients(
-            zip(net_grads, net.trainable_variables),
-            global_step=self.global_step)
-
-      with tf.control_dependencies([minimizer_op]):
-        train_op = self.ema.apply(net.trainable_variables)
-
-      acc_op, acc_update_op = self.acc_func(labels, tf.argmax(logits, axis=1))
-
-      with tf.control_dependencies([train_op, acc_update_op]):
-        return (tf.identity(net_loss), tf.identity(xe_loss),
-                tf.identity(cs_loss), tf.identity(meta_loss),
-                tf.identity(meta_acc), tf.identity(acc_op), tf.identity(weight),
-                tf.identity(labels))
-
-    # end of parallel
-    (pr_net_loss, pr_xe_loss, pr_cs_loss, pr_metaloss, pr_metaacc, pr_acc,
-     pr_weight, pr_labels) = self.strategy.run(
-         step_fn,
-         args=((next(self.train_input_iterator),
-                next(self.probe_input_iterator)),))
-    # collect device variables
-    weights = self.strategy.unwrap(pr_weight)
-    weights = tf.concat(weights, axis=0)
-    labels = self.strategy.unwrap(pr_labels)
-    labels = tf.concat(labels, axis=0)
-
-    mean_acc = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_acc)
-    mean_metaacc = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_metaacc)
-    net_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_net_loss)
-    xe_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_xe_loss)
-    cs_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_cs_loss)
-    meta_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_metaloss)
-
-    # The following add variables for tensorboard visualization
-    merges = []
-    merges.append(tf.summary.scalar('acc/train', mean_acc))
-    merges.append(tf.summary.scalar('loss/xemin', xe_loss))
-    merges.append(tf.summary.scalar('loss/consistency', cs_loss))
-    merges.append(tf.summary.scalar('loss/net', net_loss))
-    merges.append(tf.summary.scalar('loss/meta', meta_loss))
-    merges.append(tf.summary.scalar('acc/meta', mean_metaacc))
-    merges.append(
-        tf.summary.scalar('acc/eval_on_train', self.eval_acc_on_train[0]))
-    merges.append(
-        tf.summary.scalar('acc/eval_on_train_top5', self.eval_acc_on_train[1]))
-    merges.append(tf.summary.scalar('acc/num_eval', self.eval_acc_on_train[2]))
-
-    zw_inds = tf.squeeze(
-        tf.where(tf.less_equal(weights, 0), name='zero_weight_index'))
-    merges.append(
-        tf.summary.scalar(
-            'weights/zeroratio',
-            tf.math.divide(
-                tf.cast(tf.size(zw_inds), tf.float32),
-                tf.cast(tf.size(weights), tf.float32))))
-
-    self.epoch_var = tf.cast(
-        self.global_step / self.iter_epoch, tf.float32, name='epoch')
-    merges.append(tf.summary.scalar('epoch', self.epoch_var))
-    merges.append(tf.summary.scalar('learningrate', self.learning_rate))
-    summary = tf.summary.merge(merges)
-
-    return [
-        net_loss, meta_loss, xe_loss, cs_loss, mean_acc, mean_metaacc, summary,
-        weights
-    ]
-  def train_step_clean(self):
-
-    def step_fn_clean(inputs):
-      """Step functon.
-
-      Args:
-        inputs: inputs from data iterator
-
-      Returns:
-        a set of variables want to observe in Tensorboard
-      """
-      net = self.net
-      (all_images, labels), (self.probe_images, self.probe_labels) = inputs
-      print("Shape all: ")
-      print(all_images.shape,"   ",labels.shape,"   ",self.probe_images.shape,"   ",self.probe_labels.shape)
-      assert len(all_images.shape) == 5
-      images, self.aug_images = all_images[:, 0], all_images[:, 1]
-
-      self.images, self.labels = images, labels
-      batch_size = int(self.batch_size / self.strategy.num_replicas_in_sync)
-
-      logits,_ = net(images, name='model', reuse=tf.AUTO_REUSE, training=True)
-      self.logits = logits
-
-      # other losses
-      # initialized first to use self.guessed_label for meta step
-      xe_loss, cs_loss = self.unsupervised_loss()
-
-      # meta optimization
-      weight, eps, meta_loss, meta_acc = self.meta_optimize()
+      pseudo_labels = tf.argmax(logits,axis =1)
+      pseudo_labels_probe = tf.argmax(g_logits_softmax,axis =1)
 
       ## losses w.r.t new weight and loss
       onehot_labels = tf.one_hot(labels, self.dataset.num_classes)
@@ -625,8 +423,11 @@ class IEG(BaseModel):
       net_loss2 = tf.reduce_sum(tf.math.multiply(net_cost2, weight))
 
       net_loss = (net_loss1 + net_loss2) / 2
-
-      net_loss = net_loss + tf.add_n([xe_loss, cs_loss])
+      if FLAGS.scaled_loss >1:
+        net_loss *= FLAGS.scaled_loss
+        net_loss = net_loss + tf.add_n([xe_loss, cs_loss])
+      else:
+        net_loss = net_loss + tf.add_n([xe_loss, cs_loss])*FLAGS.scaled_loss
       net_loss += net.regularization_loss
       net_loss /= self.strategy.num_replicas_in_sync
 
@@ -646,18 +447,35 @@ class IEG(BaseModel):
         return (tf.identity(net_loss), tf.identity(xe_loss),
                 tf.identity(cs_loss), tf.identity(meta_loss),
                 tf.identity(meta_acc), tf.identity(acc_op), tf.identity(weight),
-                tf.identity(labels))
+                tf.identity(labels),tf.identity(sample_index),tf.identity(probe_index),tf.identity(pseudo_labels),tf.identity(pseudo_labels_probe),tf.identity(final_logit_softmax_2),tf.identity(g_logits_softmax_2))
+
     # end of parallel
     (pr_net_loss, pr_xe_loss, pr_cs_loss, pr_metaloss, pr_metaacc, pr_acc,
-     pr_weight, pr_labels) = self.strategy.run(
-         step_fn_clean,
-         args=((next(self.train_clean_input_iterator),
+     pr_weight, pr_labels,sample_index,probe_index,pseudo_labels,pseudo_labels_probe,final_logit_softmax,final_logit_softmax_probe) = self.strategy.run(
+         step_fn,
+         args=((next(self.train_input_iterator),
                 next(self.probe_input_iterator)),))
     # collect device variables
     weights = self.strategy.unwrap(pr_weight)
     weights = tf.concat(weights, axis=0)
     labels = self.strategy.unwrap(pr_labels)
     labels = tf.concat(labels, axis=0)
+
+    pseudo_labels = self.strategy.unwrap(pseudo_labels)
+    pseudo_labels = tf.concat(pseudo_labels, axis=0)
+    pseudo_labels_probe = self.strategy.unwrap(pseudo_labels_probe)
+    pseudo_labels_probe = tf.concat(pseudo_labels_probe, axis=0)
+    final_logit_softmax = self.strategy.unwrap(final_logit_softmax)
+    final_logit_softmax = tf.concat(final_logit_softmax, axis=0)
+    final_logit_softmax_probe = self.strategy.unwrap(final_logit_softmax_probe)
+    final_logit_softmax_probe = tf.concat(final_logit_softmax_probe, axis=0)
+
+   
+    
+    sample_index = self.strategy.unwrap(sample_index)
+    sample_index = tf.concat(sample_index, axis=0)
+    probe_index = self.strategy.unwrap(probe_index)
+    probe_index = tf.concat(probe_index, axis=0)
 
     mean_acc = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_acc)
     mean_metaacc = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_metaacc)
@@ -697,11 +515,14 @@ class IEG(BaseModel):
 
     return [
         net_loss, meta_loss, xe_loss, cs_loss, mean_acc, mean_metaacc, summary,
-        weights
+        weights,sample_index,probe_index,pseudo_labels,pseudo_labels_probe,final_logit_softmax,final_logit_softmax_probe
     ]
-  def update_expected_probe_operator(self):
 
-    def step_update_probe(inputs):
+
+
+  def train_step_clean(self):
+
+    def step_fn_clean(inputs):
       """Step functon.
 
       Args:
@@ -711,79 +532,134 @@ class IEG(BaseModel):
         a set of variables want to observe in Tensorboard
       """
       net = self.net
-      select_imgs, labels = inputs
-      
-      select_imgs, labels = inputs
-      _,expect_features= net(select_imgs, name='model', reuse=tf.AUTO_REUSE, training=False)
-      expect_features = tf.nn.l2_normalize(expect_features,axis = 1)
-      expect_features = tf.reshape(expect_features,(self.dataset.num_classes,self.dataset.num_probe_per_class,-1))
-      expect_features = tf.reduce_mean(expect_features,axis = 1)
-      
-     
-    
+      (all_images, labels,sample_index), (self.probe_images, self.probe_labels,self.probe_index) = inputs
+      assert len(all_images.shape) == 5
+      images, self.aug_images = all_images[:, 0], all_images[:, 1]
 
-      #with tf.control_dependencies([minimizer_op]):
-      return tf.identity(expect_features)
-    # end of parallel
-    expect_features = self.strategy.run(
-         step_update_probe, args=(next(self.selected_img_input_iterator),))
-    expect_features =  self.strategy.unwrap(expect_features)
-    
-    return [expect_features]
-  def update_probe_operator(self):
-
-    def step_update_probe():
-      """Step functon.
-
-      Args:
-        inputs: inputs from data iterator
-
-      Returns:
-        a set of variables want to observe in Tensorboard
-      """
-      net = self.net
-      
-      
-
+      self.images, self.labels = images, labels
       batch_size = int(self.batch_size / self.strategy.num_replicas_in_sync)
 
-      
+      logits,_ = net(images, name='model', reuse=tf.AUTO_REUSE, training=True)
+      self.logits = logits
 
-      
-      
-      logits,features = net(self.probe_images_weight, name='model', reuse=tf.AUTO_REUSE, training=True)
-      #self.expect_logits = tf.ones([self.dataset.num_classes,256])
-      probe_loss = tf.keras.losses.cosine_similarity(
-          self.expect_features, features)
-      probe_loss = tf.reduce_mean(probe_loss)
-      minimizer_op = self.optimizer_probe.minimize(
-            probe_loss, var_list= [self.probe_images_weight])
+      # other losses
+      # initialized first to use self.guessed_label for meta step
+      (xe_loss, cs_loss),aug_logits = self.unsupervised_loss()
+      logits_softmax = tf.stop_gradient(tf.nn.softmax(logits))
+      aug_logits_softmax = tf.stop_gradient(tf.nn.softmax(aug_logits))
+      final_logit_softmax_2 = tf.stop_gradient(tf.reduce_mean([logits_softmax,aug_logits_softmax],axis = 0))
 
-    
+      # meta optimization
+      weight, eps, meta_loss, meta_acc, g_logits_softmax = self.meta_optimize()
+      g_logits_softmax_2 = tf.stop_gradient(tf.nn.softmax(g_logits_softmax))
 
-      #with tf.control_dependencies([minimizer_op]):
-      return tf.identity(probe_loss)
+      ## losses w.r.t new weight and loss
+      onehot_labels = tf.one_hot(labels, self.dataset.num_classes)
+      onehot_labels = tf.cast(onehot_labels, tf.float32)
+      eps_k = tf.reshape(eps, [batch_size, 1])
+
+      mixed_labels = tf.math.add(
+          eps_k * onehot_labels, (1 - eps_k) * self.guessed_label,
+          name='mixed_labels')
+      net_cost = tf.losses.softmax_cross_entropy(
+          mixed_labels, logits, reduction=tf.losses.Reduction.NONE)
+      # loss with initial weight
+      net_loss1 = tf.reduce_mean(net_cost)
+
+      # loss with initial eps
+      init_eps = tf.constant(
+          [FLAGS.grad_eps_init] * batch_size, dtype=tf.float32)
+      init_eps = tf.reshape(init_eps, (-1, 1))
+      init_mixed_labels = tf.math.add(
+          init_eps * onehot_labels, (1 - init_eps) * self.guessed_label,
+          name='init_mixed_labels')
+
+      net_cost2 = tf.losses.softmax_cross_entropy(
+          init_mixed_labels, logits, reduction=tf.losses.Reduction.NONE)
+      net_loss2 = tf.reduce_sum(tf.math.multiply(net_cost2, weight))
+
+      net_loss = (net_loss1 + net_loss2) / 2
+      net_loss *= FLAGS.scaled_loss_clean
+      net_loss = net_loss + tf.add_n([xe_loss, cs_loss])
+      net_loss += net.regularization_loss
+      net_loss /= self.strategy.num_replicas_in_sync
+
+      # rescale by gpus
+      with tf.control_dependencies(net.updates):
+        net_grads = tf.gradients(net_loss, net.trainable_variables)
+        minimizer_op = self.optimizer.apply_gradients(
+            zip(net_grads, net.trainable_variables),
+            global_step=self.global_step)
+
+      with tf.control_dependencies([minimizer_op]):
+        train_op = self.ema.apply(net.trainable_variables)
+
+      acc_op, acc_update_op = self.acc_func(labels, tf.argmax(logits, axis=1))
+
+      with tf.control_dependencies([train_op, acc_update_op]):
+        return (tf.identity(net_loss), tf.identity(xe_loss),
+                tf.identity(cs_loss), tf.identity(meta_loss),
+                tf.identity(meta_acc), tf.identity(acc_op), tf.identity(weight),
+                tf.identity(labels),tf.identity(sample_index),tf.identity(self.probe_index),tf.identity(final_logit_softmax_2),tf.identity(g_logits_softmax_2))
     # end of parallel
-    probe_loss = self.strategy.run(
-         step_update_probe)
-   
-    probe_loss = self.strategy.unwrap(probe_loss)
-    #probe_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, probe_loss)
-    
-    return [probe_loss]
-  def reset_probe_gradient(self):
-    all_loss = []
-    self.expect_features = self.sess.run([
-            self.update_expected_probe_op])
-    for i in range(50):
-      curr_loss = self.sess.run([
-            self.update_probe_op])
-      all_loss.append(curr_loss)
-    print("ALl loss list: ")
-    print(all_loss)
-    self.dataset.new_logits = False
-    self.dataset.probe_data =  self.sess.run([
-            self.probe_images_weight])
+    (pr_net_loss, pr_xe_loss, pr_cs_loss, pr_metaloss, pr_metaacc, pr_acc,
+     pr_weight, pr_labels,sample_index,probe_index,final_logit_softmax,final_logit_softmax_probe) = self.strategy.run(
+         step_fn_clean,
+         args=((next(self.train_clean_input_iterator),
+                next(self.probe_input_iterator)),))
+    # collect device variables
+    weights = self.strategy.unwrap(pr_weight)
+    weights = tf.concat(weights, axis=0)
+    labels = self.strategy.unwrap(pr_labels)
+    labels = tf.concat(labels, axis=0)
+
+
+    final_logit_softmax = self.strategy.unwrap(final_logit_softmax)
+    final_logit_softmax = tf.concat(final_logit_softmax, axis=0)
+    final_logit_softmax_probe = self.strategy.unwrap(final_logit_softmax_probe)
+    final_logit_softmax_probe = tf.concat(final_logit_softmax_probe, axis=0)
+
+    mean_acc = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_acc)
+    mean_metaacc = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_metaacc)
+    net_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_net_loss)
+    xe_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_xe_loss)
+    cs_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_cs_loss)
+    meta_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, pr_metaloss)
+
+    # The following add variables for tensorboard visualization
+    merges = []
+    merges.append(tf.summary.scalar('acc/train', mean_acc))
+    merges.append(tf.summary.scalar('loss/xemin', xe_loss))
+    merges.append(tf.summary.scalar('loss/consistency', cs_loss))
+    merges.append(tf.summary.scalar('loss/net', net_loss))
+    merges.append(tf.summary.scalar('loss/meta', meta_loss))
+    merges.append(tf.summary.scalar('acc/meta', mean_metaacc))
+    merges.append(
+        tf.summary.scalar('acc/eval_on_train', self.eval_acc_on_train[0]))
+    merges.append(
+        tf.summary.scalar('acc/eval_on_train_top5', self.eval_acc_on_train[1]))
+    merges.append(tf.summary.scalar('acc/num_eval', self.eval_acc_on_train[2]))
+
+    zw_inds = tf.squeeze(
+        tf.where(tf.less_equal(weights, 0), name='zero_weight_index'))
+    merges.append(
+        tf.summary.scalar(
+            'weights/zeroratio',
+            tf.math.divide(
+                tf.cast(tf.size(zw_inds), tf.float32),
+                tf.cast(tf.size(weights), tf.float32))))
+
+    self.epoch_var = tf.cast(
+        self.global_step / self.iter_epoch, tf.float32, name='epoch')
+    merges.append(tf.summary.scalar('epoch', self.epoch_var))
+    merges.append(tf.summary.scalar('learningrate', self.learning_rate))
+    summary = tf.summary.merge(merges)
+
+    return [
+        net_loss, meta_loss, xe_loss, cs_loss, mean_acc, mean_metaacc, summary,
+        weights,sample_index,probe_index,final_logit_softmax,final_logit_softmax_probe
+    ]
+
 
   def train(self):
     self.set_input()
@@ -804,12 +680,10 @@ class IEG(BaseModel):
             self.train_input_iterator.initializer,
             self.probe_input_iterator.initializer,
             self.train_clean_input_iterator.initializer,
-            self.selected_img_input_iterator.initializer
         ])
-      if len(FLAGS.update_probe) > 0:
+      if len(FLAGS.update_probe) > 0 :
         self.sess.run([
-            self.train_reset_input_iterator.initializer,
-            self.dropout_input_iterator.initializer
+            self.train_reset_input_iterator.initializer
         ])
       self.sess.run([self.eval_input_iterator.initializer])
 
@@ -817,13 +691,15 @@ class IEG(BaseModel):
       iter_epoch = self.iter_epoch
 
       self.saver = tf.train.Saver(max_to_keep=4)
-      if len(FLAGS.used_pretrained_20k) > 0:
+      if len(FLAGS.pretrained_path) > 0 or FLAGS.using_colab:
         shutil.rmtree(FLAGS.checkpoint_path)
-        shutil.copytree(FLAGS.used_pretrained_20k,FLAGS.checkpoint_path) 
+        shutil.copytree("data-ieg-active/"+str(FLAGS.checkpoint_path.split("/")[-1]),FLAGS.checkpoint_path) 
+
       self.load_model()
       FLAGS.restore_step = self.global_step.eval()
 
       pbar = tqdm(total=(FLAGS.max_iteration - FLAGS.restore_step))
+
       update_probe_interval = 500000
       update_clean_interval = 500000
       probe_lr_threshold = -1
@@ -834,24 +710,54 @@ class IEG(BaseModel):
         probe_lr_threshold = float(FLAGS.update_probe.split("-")[-1].split("_")[-2])
         update_clean_interval = int(FLAGS.update_probe.split("-")[-2].split("_")[-1])
         clean_lr_threshold = float(FLAGS.update_probe.split("-")[-2].split("_")[-2])
-      logging.info("update_probe_interval: {}".format(update_probe_interval))
-      logging.info("probe_lr_threshold: {:.2f}".format(probe_lr_threshold))
-      logging.info("update_clean_interval: {}".format(update_clean_interval))
-      logging.info("clean_lr_threshold: {:.2f}".format(clean_lr_threshold))
+
       for iteration in range(FLAGS.restore_step + 1, FLAGS.max_iteration + 1):
         self.update_learning_rate(iteration)
         if iteration < FLAGS.warmup_iteration:
           assert FLAGS.active == True
           curr_train_op = self.train_clean_op
+          (lr, net_loss, meta_loss, xe_loss, cs_loss, acc, meta_acc,
+           merged_summary, weights,sample_index,probe_index,final_logit_softmax,final_logit_softmax_probe) = (
+               self.sess.run([self.learning_rate] + curr_train_op))
+
+          
+          if FLAGS.update_probe:
+            curr_samples_logits = self.dataset.all_predict_logit[0][sample_index][:,1:,:].copy()
+            self.dataset.all_predict_logit[0][sample_index,:-1,:] = curr_samples_logits
+            self.dataset.all_predict_logit[0][sample_index,-1,:] = final_logit_softmax
+            self.dataset.all_predict_logit[1][sample_index] += 1
+            self.dataset.all_predict_logit[1][sample_index] = (self.dataset.all_predict_logit[1][sample_index] <= 5)*self.dataset.all_predict_logit[1][sample_index] + (self.dataset.all_predict_logit[1][sample_index] > 5)*5
+            
+            curr_samples_logits_probe = self.dataset.all_predict_logit[0][probe_index][:,1:].copy()
+            self.dataset.all_predict_logit[0][probe_index,:-1,:] = curr_samples_logits_probe
+            self.dataset.all_predict_logit[0][probe_index,-1,:] = final_logit_softmax_probe            
+            self.dataset.all_predict_logit[1][probe_index] += 1
+            self.dataset.all_predict_logit[1][probe_index] = (self.dataset.all_predict_logit[1][probe_index] <= 5)*self.dataset.all_predict_logit[1][probe_index] + (self.dataset.all_predict_logit[1][probe_index] > 5)*5
         else:
           curr_train_op = self.train_op
-        (lr, net_loss, meta_loss, xe_loss, cs_loss, acc, meta_acc,
-         merged_summary, weights) = (
-             self.sess.run([self.learning_rate] + curr_train_op))
+          (lr, net_loss, meta_loss, xe_loss, cs_loss, acc, meta_acc,
+           merged_summary, weights,sample_index,probe_index,pseudo_labels,pseudo_label_probe,final_logit_softmax,final_logit_softmax_probe) = (
+               self.sess.run([self.learning_rate] + curr_train_op))
+
+          
+          if FLAGS.update_probe:
+            curr_samples_logits = self.dataset.all_predict_logit[0][sample_index][:,1:,:].copy()
+            self.dataset.all_predict_logit[0][sample_index,:-1,:] = curr_samples_logits
+            self.dataset.all_predict_logit[0][sample_index,-1,:] = final_logit_softmax
+            self.dataset.all_predict_logit[1][sample_index] += 1
+            self.dataset.all_predict_logit[1][sample_index] = (self.dataset.all_predict_logit[1][sample_index] <= 5)*self.dataset.all_predict_logit[1][sample_index] + (self.dataset.all_predict_logit[1][sample_index] > 5)*5
+
+            curr_samples_logits_probe = self.dataset.all_predict_logit[0][probe_index][:,1:].copy()
+            self.dataset.all_predict_logit[0][probe_index,:-1,:] = curr_samples_logits_probe
+            self.dataset.all_predict_logit[0][probe_index,-1,:] = final_logit_softmax_probe            
+            self.dataset.all_predict_logit[1][probe_index] += 1
+            self.dataset.all_predict_logit[1][probe_index] = (self.dataset.all_predict_logit[1][probe_index] <= 5)*self.dataset.all_predict_logit[1][probe_index] + (self.dataset.all_predict_logit[1][probe_index] > 5)*5
+           
+            
         pbar.update(1)
         message = ('Epoch {}[{}/{}] lr{:.3f} meta_loss:{:.2f} loss:{:.2f} '
                    'mc_loss:{:.2f} uc_loss:{:.2f} weight{:.2f}({:.2f}) '
-                   'acc:{:.2f} mata_acc{:.2f}  clean_size{:.2f} train_size{:.2f}').format(iteration // iter_epoch,
+                   'acc:{:.2f} mata_acc{:.2f}  clean_size{:.2f} train_size{:.2f} acc_real{:.2f} acc_cl{:.2f}').format(iteration // iter_epoch,
                                                        iteration % iter_epoch,
                                                        iter_epoch, lr,
                                                        float(meta_loss),
@@ -861,15 +767,25 @@ class IEG(BaseModel):
                                                        float(np.mean(weights)),
                                                        float(np.std(weights)),
                                                        float(acc),
-                                                       float(meta_acc),float(len(self.dataset.clean_index)),self.dataset.train_data.shape[0])
+                                                       float(meta_acc),float(len(self.dataset.clean_index)),self.dataset.train_data.shape[0],self.dataset.real_acc_train,self.dataset.acc_clean)
         pbar.set_description(message)
         self.summary_writer.add_summary(merged_summary, iteration)
         update_probe_now = False
         update_clean_now = False
         if FLAGS.update_probe != "":
           if iteration > FLAGS.warmup_iteration:
-            if iteration%100 == 0:
-              self.reset_probe_gradient()
+            if len(self.dataset.noise_index) > 0 and ((lr <= clean_lr_threshold and iteration % update_clean_interval == 1) or lr == 0):
+                update_clean_now = True
+                list_update_clean.append(iteration)
+            if (lr <= probe_lr_threshold and iteration % update_probe_interval == 1 and len(FLAGS.update_probe) > 0) or lr == 0:
+                update_probe_now = True
+                list_update_probe.append(iteration)
+
+            if update_clean_now or update_probe_now:
+                print("Active selection at iteration ",iteration," with update_clean_now ",update_clean_now,"  and update_probe_now ",update_probe_now)
+                print("Number image noisy before reseting: ",len(self.dataset.noise_index))
+                self.reset_train_ds(update_probe_now,update_clean_now,lr)
+
 
         # checkpoint
         if self.time_for_evaluation(iteration, lr):
@@ -877,10 +793,20 @@ class IEG(BaseModel):
           self.evaluate(iteration, lr)
           self.save_model(iteration)
           self.summary_writer.flush()
-
+          if FLAGS.active :
+              
+              non_clean_index = list(set([i for i in range(len(self.dataset.all_data_label))]).difference(set(self.dataset.clean_index)))
+              print("Average count of clean: ",np.mean(self.dataset.all_predict_logit[1][self.dataset.clean_index]))
+              print("Average count of non-clean: ",np.mean(self.dataset.all_predict_logit[1][non_clean_index]))
+              logging.info(str(("Previous adding acc: ",self.dataset.all_adding_acc)))
+              logging.info(str(("List update probe: ",list_update_probe)))
+              logging.info(str(("List update clean: ",list_update_clean)))
+              logging.info(str(("List acc probe: ",self.dataset.all_probe_acc)))
           
         if FLAGS.gcloud and iteration == 20000:
           upload_checkpoint(FLAGS.dst_bucket_project,FLAGS.dst_bucket_name,FLAGS.checkpoint_path)
+        if iteration == 86000:
+          break
       # end of iterations
       pbar.close()
       if FLAGS.gcloud:
